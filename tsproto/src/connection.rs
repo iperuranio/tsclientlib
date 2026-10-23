@@ -396,7 +396,17 @@ impl Connection {
 		cx: &mut Context, packet: &OutUdpPacket,
 	) -> Poll<Result<()>> {
 		let data = packet.data().data();
-		match udp_socket.poll_send_to(cx, data, address).map_err(Error::Network)? {
+		let sent = match udp_socket.poll_send_to(cx, data, address) {
+			Poll::Ready(Err(e)) if no_buffer_space(&e) => {
+				// The system had no room for the datagram (Windows' WSAENOBUFS under a heavy
+				// upload, a screen share beside the voice): it is lost, as on the network, and the
+				// resender sends it again if it matters. Never the end of the connection.
+				tracing::debug!(%e, "UDP packet dropped, no buffer space");
+				return Poll::Ready(Ok(()));
+			}
+			other => other.map_err(Error::Network)?,
+		};
+		match sent {
 			Poll::Pending => Poll::Pending,
 			Poll::Ready(size) => {
 				let event = Event::SendUdpPacket(packet);
@@ -473,5 +483,35 @@ impl Stream for Connection {
 		}
 
 		Poll::Pending
+	}
+}
+
+/// Whether a send failed only because the system's buffers were full (ENOBUFS, WSAENOBUFS): a
+/// datagram lost, not a broken socket.
+fn no_buffer_space(e: &io::Error) -> bool {
+	#[cfg(windows)]
+	const ENOBUFS: i32 = 10055;
+	#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+	const ENOBUFS: i32 = 55;
+	#[cfg(not(any(windows, target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+	const ENOBUFS: i32 = 105;
+	e.raw_os_error() == Some(ENOBUFS)
+}
+
+#[cfg(test)]
+mod no_buffer_tests {
+	use super::*;
+
+	#[test]
+	fn full_system_buffers_are_a_lost_packet_and_other_errors_stay_errors() {
+		#[cfg(windows)]
+		let enobufs = 10055;
+		#[cfg(target_os = "macos")]
+		let enobufs = 55;
+		#[cfg(target_os = "linux")]
+		let enobufs = 105;
+		assert!(no_buffer_space(&io::Error::from_raw_os_error(enobufs)));
+		assert!(!no_buffer_space(&io::Error::from(io::ErrorKind::ConnectionRefused)));
+		assert!(!no_buffer_space(&io::Error::from(io::ErrorKind::Other)));
 	}
 }
